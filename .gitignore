@@ -1,0 +1,54 @@
+﻿# ===== Git 备份 =====
+.git.backup/
+
+# ===== 大文件文件夹 =====
+checkpoints/
+data/
+
+# ===== 输出结果（图片、视频等） =====
+eval/**/*.png
+eval/**/*.jpg
+eval/**/*.jpeg
+eval/**/*.mp4
+eval/**/*.avi
+logs/
+visuals/
+outputs/
+results/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.so
+
+# ===== 虚拟环境 =====
+venv/
+env/
+.venv/
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+
+# ===== 临时文件 =====
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== 模型文件 =====
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.pkl
+
+# ===== 调试文件 =====
+debug/
