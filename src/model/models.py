@@ -1,5 +1,6 @@
 """
-Main model implementation with Multi-View Attention
+Main model implementation with Multi-View Attention and Smart Feature Fusion
+Enhanced version with multi-scale features
 """
 import torch
 import torch.nn as nn
@@ -11,68 +12,6 @@ from util import repeat_interleave
 import os
 import os.path as osp
 import warnings
-
-
-class MultiViewAttention(nn.Module):
-    """多视图注意力模块"""
-    def __init__(self, feature_dim, num_heads=4):
-        super().__init__()
-        self.num_heads = num_heads
-        self.feature_dim = feature_dim
-
-        # 确保特征维度可以被头数整除
-        assert feature_dim % num_heads == 0, f"feature_dim {feature_dim} must be divisible by num_heads {num_heads}"
-
-        self.head_dim = feature_dim // num_heads
-
-        # Q, K, V 投影层
-        self.query = nn.Linear(feature_dim, feature_dim)
-        self.key = nn.Linear(feature_dim, feature_dim)
-        self.value = nn.Linear(feature_dim, feature_dim)
-
-        # 输出投影
-        self.out_proj = nn.Linear(feature_dim, feature_dim)
-
-        # Layer Norm
-        self.norm = nn.LayerNorm(feature_dim)
-
-    def forward(self, features, mask=None):
-        """
-        Args:
-            features: [B*NS, N_points, feature_dim] 多视图特征
-            mask: [B*NS, N_points] 可选的掩码
-        Returns:
-            attended_features: [B, N_points, feature_dim] 注意力加权后的特征
-        """
-        B_NS, N, D = features.shape
-
-        # 投影到 Q, K, V
-        Q = self.query(features).view(B_NS, N, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.key(features).view(B_NS, N, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.value(features).view(B_NS, N, self.num_heads, self.head_dim).transpose(1, 2)
-
-        # 计算注意力分数 [B_NS, num_heads, N, N]
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
-
-        # 应用掩码（如果有）
-        if mask is not None:
-            mask = mask.unsqueeze(1).unsqueeze(2)  # [B_NS, 1, 1, N]
-            scores = scores.masked_fill(mask == 0, -1e9)
-
-        # Softmax 归一化
-        attn_weights = torch.softmax(scores, dim=-1)
-
-        # 加权求和
-        attended = torch.matmul(attn_weights, V)  # [B_NS, num_heads, N, head_dim]
-        attended = attended.transpose(1, 2).contiguous().view(B_NS, N, D)
-
-        # 输出投影
-        output = self.out_proj(attended)
-
-        # 残差连接 + Layer Norm
-        output = self.norm(output + features)
-
-        return output
 
 
 class PixelNeRFNet(torch.nn.Module):
@@ -87,7 +26,6 @@ class PixelNeRFNet(torch.nn.Module):
         self.encoder = make_encoder(conf["encoder"])
         self.use_encoder = conf.get_bool("use_encoder", True)
         self.use_xyz = conf.get_bool("use_xyz", False)
-
         assert self.use_encoder or self.use_xyz
 
         # ========== 基础配置 ==========
@@ -98,460 +36,330 @@ class PixelNeRFNet(torch.nn.Module):
         self.use_viewdirs = conf.get_bool("use_viewdirs", False)
         self.use_global_encoder = conf.get_bool("use_global_encoder", False)
 
-        # ========== 多视图注意力配置（原有的，保留） ==========
-        self.use_attention = conf.get_bool("use_attention", True)
-        self.attention_heads = conf.get_int("attention_heads", 4)
-
-        # ========== 新增：智能特征融合配置 ==========
+        # ========== 智能特征融合配置 ==========
         self.use_smart_fusion = conf.get_bool("use_smart_fusion", False)
         self.use_adaptive_sampling = conf.get_bool("use_adaptive_sampling", False)
         self.fusion_heads = conf.get_int("fusion_heads", 8)
         self.fusion_dropout = conf.get_float("fusion_dropout", 0.1)
-        self.fusion_type = conf.get_string("fusion_type", "attention")  # attention, weighted, adaptive
+        self.fusion_type = conf.get_string("fusion_type", "attention")
         self.use_cbam = conf.get_bool("use_cbam", True)
         self.quality_threshold = conf.get_float("quality_threshold", 0.3)
 
         # ========== 修复：统一处理 encoder.latent_size ==========
         encoder_latent_size = self.encoder.latent_size
-
         if isinstance(encoder_latent_size, (list, tuple)):
             # ✅ 多尺度特征：求和得到总维度
             self.latent_size = sum(int(x) for x in encoder_latent_size)
+            self.is_multi_scale = True
+            self.layer_dims = [int(x) for x in encoder_latent_size]
             print(f"✅ Multi-scale encoder detected:")
-            print(f"   - Layer sizes: {encoder_latent_size}")
+            print(f"   - Layer sizes: {self.layer_dims}")
             print(f"   - Total latent size: {self.latent_size}")
         else:
             # ✅ 单尺度特征：直接使用
             self.latent_size = int(encoder_latent_size)
+            self.is_multi_scale = False
+            self.layer_dims = [self.latent_size]
             print(f"✅ Single-scale encoder:")
             print(f"   - Latent size: {self.latent_size}")
 
-        # ========== 初始化多视图注意力模块（原有的，保留） ==========
-        if self.use_attention and not self.use_smart_fusion:
-            self.attention = MultiViewAttention(
-                feature_dim=self.latent_size,
-                num_heads=self.attention_heads
-            )
-            print(f"✅ Legacy Multi-View Attention enabled:")
-            print(f"   - Attention heads: {self.attention_heads}")
-            print(f"   ⚠️  Consider upgrading to smart_fusion for better performance")
-
-        # ========== 新增：初始化智能特征融合模块 ==========
+        # ========== 初始化智能特征融合模块 ==========
         if self.use_smart_fusion:
             try:
                 from .feature_fusion import SmartFeatureFusion
 
-                self.feature_fusion = SmartFeatureFusion(
-                    feature_dim=self.latent_size,
-                    num_heads=self.fusion_heads,
-                    dropout=self.fusion_dropout,
-                    fusion_type=self.fusion_type,
-                    use_cbam=self.use_cbam
-                )
-                print(f"✅ Smart Feature Fusion enabled:")
-                print(f"   - Fusion type: {self.fusion_type}")
-                print(f"   - Fusion heads: {self.fusion_heads}")
-                print(f"   - Dropout: {self.fusion_dropout}")
-                print(f"   - CBAM attention: {self.use_cbam}")
-
-                # ✅ 如果启用了智能融合，禁用旧的注意力机制
-                if self.use_attention:
-                    print(f"   ⚠️  Disabling legacy attention (using smart fusion instead)")
-                    self.use_attention = False
+                # 如果是多尺度，使用融合模块
+                if self.is_multi_scale:
+                    self.feature_fusion = SmartFeatureFusion(
+                        layer_dims=self.layer_dims,
+                        output_dim=512,  # 融合后的输出维度
+                        use_attention=(self.fusion_type == "attention"),
+                        dropout=self.fusion_dropout,
+                        num_heads=self.fusion_heads,
+                        use_cbam=self.use_cbam
+                    )
+                    # 更新 latent_size 为融合后的维度
+                    self.latent_size = 512
+                    print(f"✅ Smart Feature Fusion enabled:")
+                    print(f"   - Fusion type: {self.fusion_type}")
+                    print(f"   - Fusion heads: {self.fusion_heads}")
+                    print(f"   - CBAM: {'✅' if self.use_cbam else '❌'}")
+                    print(f"   - Output dimension: {self.latent_size}")
+                else:
+                    print(f"⚠️  Smart fusion requested but encoder is single-scale")
+                    self.use_smart_fusion = False
 
             except ImportError as e:
                 print(f"❌ Failed to import SmartFeatureFusion: {e}")
-                print(f"   Falling back to legacy attention mechanism")
+                print(f"⚠️  Falling back to basic multi-scale concatenation")
                 self.use_smart_fusion = False
-                if self.use_attention:
-                    self.attention = MultiViewAttention(
-                        feature_dim=self.latent_size,
-                        num_heads=self.attention_heads
-                    )
 
-        # ========== 新增：初始化自适应采样器 ==========
-        if self.use_adaptive_sampling:
-            try:
-                from .feature_fusion import AdaptiveFeatureSampler
+        # ========== 位置编码 ==========
+        d_latent = 0
+        d_in = 3  # xyz 坐标
 
-                self.feature_sampler = AdaptiveFeatureSampler(
-                    feature_dim=self.latent_size,
-                    quality_threshold=self.quality_threshold
-                )
-                print(f"✅ Adaptive Feature Sampling enabled:")
-                print(f"   - Quality threshold: {self.quality_threshold}")
-                print(f"   - Feature dim: {self.latent_size}")
-
-            except ImportError as e:
-                print(f"❌ Failed to import AdaptiveFeatureSampler: {e}")
-                print(f"   Disabling adaptive sampling")
-                self.use_adaptive_sampling = False
-
-        # ========== 计算 MLP 输入维度 ==========
-        d_latent = self.latent_size if self.use_encoder else 0
-        d_in = 3 if self.use_xyz else 1
-
-        # 处理视角方向编码
-        if self.use_viewdirs and self.use_code_viewdirs:
-            d_in += 3
-
-        # 位置编码
-        if self.use_code and d_in > 0:
-            self.code = PositionalEncoding.from_conf(conf["code"], d_in=d_in)
+        if self.use_code:
+            num_freqs = conf.get_int("code.num_freqs", 6)
+            freq_factor = conf.get_float("code.freq_factor", 1.5)
+            include_input = conf.get_bool("code.include_input", True)
+            self.code = PositionalEncoding.from_conf(
+                num_freqs, freq_factor=freq_factor, include_input=include_input
+            )
             d_in = self.code.d_out
+            print(f"✅ Positional encoding for xyz: {d_in} dims")
 
-        if self.use_viewdirs and not self.use_code_viewdirs:
-            d_in += 3
-
-        # ========== 全局编码器（如果启用） ==========
-        if self.use_global_encoder:
-            self.global_encoder = ImageEncoder.from_conf(conf["global_encoder"])
-
-            # ✅ 处理全局编码器的 latent_size
-            global_latent = self.global_encoder.latent_size
-            if isinstance(global_latent, (list, tuple)):
-                self.global_latent_size = sum(int(x) for x in global_latent)
+        # 视角方向编码
+        if self.use_viewdirs:
+            if self.use_code_viewdirs:
+                num_freqs_viewdirs = conf.get_int("code_viewdirs.num_freqs", 4)
+                freq_factor_viewdirs = conf.get_float("code_viewdirs.freq_factor", 1.5)
+                include_input_viewdirs = conf.get_bool("code_viewdirs.include_input", True)
+                self.code_viewdirs = PositionalEncoding.from_conf(
+                    num_freqs_viewdirs,
+                    freq_factor=freq_factor_viewdirs,
+                    include_input=include_input_viewdirs
+                )
+                d_latent = self.code_viewdirs.d_out
+                print(f"✅ Positional encoding for viewdirs: {d_latent} dims")
             else:
-                self.global_latent_size = int(global_latent)
+                d_latent = 3
+                print(f"✅ Raw viewdirs: {d_latent} dims")
 
-            d_latent += self.global_latent_size
-            print(f"✅ Global encoder enabled:")
-            print(f"   - Global latent size: {self.global_latent_size}")
-            print(f"   - Total latent size: {d_latent}")
+        # ========== MLP 输入维度计算 ==========
+        if self.use_encoder:
+            d_in = self.latent_size + d_in  # 特征 + xyz编码
 
-        d_out = 4  # RGB + density
+        print(f"\n📊 MLP Input Configuration:")
+        print(f"   - Feature dimension: {self.latent_size}")
+        print(f"   - XYZ dimension: {d_in - self.latent_size}")
+        print(f"   - Viewdir dimension: {d_latent}")
+        print(f"   - Total input dimension: {d_in}")
 
-        # ========== 打印 MLP 配置信息 ==========
-        print(f"\n{'=' * 60}")
-        print(f"MLP Configuration Summary:")
-        print(f"{'=' * 60}")
-        print(f"  Input dimension (d_in):        {d_in}")
-        print(f"    ├─ use_xyz:                  {self.use_xyz}")
-        print(f"    ├─ use_viewdirs:             {self.use_viewdirs}")
-        print(f"    └─ use_code (pos encoding):  {self.use_code}")
-        print(f"  Latent dimension (d_latent):   {d_latent}")
-        print(f"    ├─ encoder latent:           {self.latent_size}")
-        if self.use_global_encoder:
-            print(f"    └─ global encoder latent:    {self.global_latent_size}")
-        print(f"  Output dimension (d_out):      {d_out} (RGB + σ)")
-        print(f"{'=' * 60}\n")
-
-        # ========== 创建 MLP 网络 ==========
-        self.mlp_coarse = make_mlp(conf["mlp_coarse"], d_in, d_latent, d_out=d_out)
+        # ========== MLP 解码器 ==========
+        self.mlp_coarse = make_mlp(conf["mlp_coarse"], d_in, d_latent=d_latent)
         self.mlp_fine = make_mlp(
-            conf["mlp_fine"], d_in, d_latent, d_out=d_out, allow_empty=True
+            conf["mlp_fine"], d_in, d_latent=d_latent, allow_empty=True
         )
-        print(f"✅ MLP networks created:")
-        print(f"   - Coarse MLP: {d_in} + {d_latent} -> {d_out}")
-        if self.mlp_fine is not None:
-            print(f"   - Fine MLP:   {d_in} + {d_latent} -> {d_out}")
 
-        # ========== 停止编码器梯度（如果需要） ==========
-        if self.stop_encoder_grad:
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-            print(f"⚠️  Encoder gradients stopped (fine-tuning mode)")
+        # 如果没有 fine 网络，使用 coarse 网络
+        if self.mlp_fine is None:
+            self.mlp_fine = self.mlp_coarse
+            print("⚠️  No separate fine MLP, using coarse MLP for both")
 
-        # ========== 注册缓冲区 ==========
-        self.register_buffer("poses", torch.empty(1, 3, 4), persistent=False)
-        self.register_buffer("image_shape", torch.empty(2), persistent=False)
-        self.register_buffer("focal", torch.empty(1, 2), persistent=False)
-        self.register_buffer("c", torch.empty(1, 2), persistent=False)
-
-        # ========== 保存维度信息 ==========
+        # 输出维度
         self.d_in = d_in
-        self.d_out = d_out
+        self.d_out = 4  # RGB + density
         self.d_latent = d_latent
 
-        # ========== 初始化计数器 ==========
-        self.num_objs = 0
-        self.num_views_per_obj = 1
+        # ========== 全局特征编码器（可选） ==========
+        if self.use_global_encoder:
+            self.global_encoder = nn.Sequential(
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(),
+                nn.Linear(self.latent_size, 256),
+                nn.ReLU(inplace=True),
+                nn.Linear(256, 256)
+            )
+            print("✅ Global encoder enabled")
 
-        print(f"\n{'=' * 60}")
-        print(f"✅ PixelNeRFNet initialization complete!")
-        print(f"{'=' * 60}\n")
+        print(f"\n✅ PixelNeRFNet initialized:")
+        print(f"   - Input dimension: {d_in}")
+        print(f"   - Latent dimension: {d_latent}")
+        print(f"   - Output dimension: {self.d_out}")
+        print(f"   - Use encoder: {self.use_encoder}")
+        print(f"   - Use xyz: {self.use_xyz}")
+        print(f"   - Use viewdirs: {self.use_viewdirs}")
+        print(f"   - Smart fusion: {'✅' if self.use_smart_fusion else '❌'}")
+        print(f"   - Adaptive sampling: {'✅' if self.use_adaptive_sampling else '❌'}")
 
     def encode(self, images, poses, focal, z_bounds=None, c=None):
         """
-        编码输入图像和相机参数
-        :param images (NS, 3, H, W) or (B, NS, 3, H, W)
-        :param poses (NS, 4, 4) or (B, NS, 4, 4)
-        :param focal focal length
-        :param z_bounds ignored
-        :param c principal point
+        编码输入图像
+        :param images (NS, 3, H, W) 输入图像
+        :param poses (NS, 4, 4) 相机位姿
+        :param focal (NS,) 或 (NS, 2) 焦距
+        :param z_bounds (NS, 2) 深度边界
+        :param c (NS,) 可选的类别编码
+        :return latent 编码后的特征
         """
-        self.num_objs = images.size(0)
+        if images.shape[0] == 0:
+            return None
 
-        # ✅ 处理输入维度
-        if len(images.shape) == 5:
-            # (B, NS, 3, H, W) -> 多个物体，每个物体多个视点
-            assert len(poses.shape) == 4
-            assert poses.size(1) == images.size(1)
-            self.num_views_per_obj = images.size(1)
+        # ✅ 停止梯度（如果需要）
+        if self.stop_encoder_grad:
+            images = images.detach()
 
-            batch_size = images.size(0)
-            num_views = images.size(1)
+        # ✅ 编码图像
+        with profiler.record_function("encoder_forward"):
+            latent = self.encoder(images)
 
-            # 展平为 (B*NS, 3, H, W)
-            images = images.reshape(-1, *images.shape[2:])
-            poses = poses.reshape(-1, 4, 4)
-        else:
-            # (NS, 3, H, W) -> 单个物体，多个视点
-            self.num_views_per_obj = 1
-            batch_size = images.size(0)
-            num_views = 1
+        # ✅ 应用智能特征融合（如果启用）
+        if self.use_smart_fusion and self.is_multi_scale:
+            with profiler.record_function("feature_fusion"):
+                # latent 是多尺度特征列表
+                if isinstance(latent, list):
+                    latent = self.feature_fusion(latent)  # 返回 (NS, output_dim, H, W)
 
-        # ✅ 编码所有视点的图像
-        if self.use_encoder:
-            # 提取特征（encoder 会自动处理多尺度）
-            all_latents = self.encoder(images)  # 返回 (B*NS, C, H, W) 或 List[(B*NS, C_i, H, W)]
-
-            # ✅ 处理多尺度特征
-            if isinstance(all_latents, (list, tuple)):
-                # 多尺度特征 -> 使用 encoder 的统一方法
-                all_latents = self.encoder.get_unified_features()  # (B*NS, C_total, H, W)
-                print(f"✅ Multi-scale features unified: {all_latents.shape}")
-
-            # ✅ 多视点特征融合
-            if num_views > 1 and (self.use_smart_fusion or self.use_adaptive_sampling):
-                C, H, W = all_latents.shape[1:]
-
-                # 重塑为 (B, NS, C, H, W)
-                all_latents = all_latents.reshape(batch_size, num_views, C, H, W)
-
-                # 分离每个视点的特征
-                latent_list = [all_latents[:, i] for i in range(num_views)]  # List[(B, C, H, W)]
-
-                # ✅ 自适应采样（可选）
-                if self.use_adaptive_sampling:
-                    latent_list, valid_indices = self.feature_sampler(
-                        latent_list,
-                        top_k=min(3, num_views),
-                        quality_threshold=0.3
-                    )
-                    print(f"✅ Adaptive sampling: {len(valid_indices)}/{num_views} views selected")
-
-                # ✅ 智能特征融合
-                if self.use_smart_fusion:
-                    fused_latent = self.feature_fusion(latent_list)  # (B, C, H, W)
-                    print(f"✅ Smart fusion: {len(latent_list)} views -> 1 fused feature")
-                else:
-                    # 简单平均（向后兼容）
-                    fused_latent = torch.stack(latent_list, dim=0).mean(dim=0)
-                    print(f"⚠️ Simple averaging: {len(latent_list)} views")
-
-                # ✅ 复制融合特征到所有视点（保持形状兼容性）
-                self.encoder.latent = fused_latent.unsqueeze(1).repeat(1, num_views, 1, 1, 1).reshape(-1, C, H, W)
-
-            else:
-                # 单视点或不使用融合，直接使用
-                self.encoder.latent = all_latents
-                if num_views > 1:
-                    print(f"⚠️ Multi-view input but fusion disabled")
-
-        # ✅ 处理相机位姿
-        rot = poses[:, :3, :3].transpose(1, 2)  # (B*NS, 3, 3)
-        trans = -torch.bmm(rot, poses[:, :3, 3:])  # (B*NS, 3, 1)
-        self.poses = torch.cat((rot, trans), dim=-1)  # (B*NS, 3, 4)
-
-        # ✅ 存储图像形状
-        self.image_shape[0] = images.shape[-1]
-        self.image_shape[1] = images.shape[-2]
-
-        # ✅ 处理焦距
-        if len(focal.shape) == 0:
-            focal = focal[None, None].repeat((1, 2))
-        elif len(focal.shape) == 1:
-            focal = focal.unsqueeze(-1).repeat((1, 2))
-        else:
-            focal = focal.clone()
-        self.focal = focal.float()
-        self.focal[..., 1] *= -1.0
-
-        # ✅ 处理主点
-        if c is None:
-            c = (self.image_shape * 0.5).unsqueeze(0)
-        elif len(c.shape) == 0:
-            c = c[None, None].repeat((1, 2))
-        elif len(c.shape) == 1:
-            c = c.unsqueeze(-1).repeat((1, 2))
+        # ✅ 保存编码后的特征和相机参数
+        self.latent = latent
+        self.poses = poses
+        self.focal = focal
         self.c = c
+        self.z_bounds = z_bounds
 
-        # ✅ 全局编码器（如果启用）
+        # ✅ 计算图像尺寸
+        if isinstance(latent, torch.Tensor):
+            self.latent_scaling = images.shape[-1] / latent.shape[-1]
+        else:
+            # 多尺度特征，使用第一层的尺寸
+            self.latent_scaling = images.shape[-1] / latent[0].shape[-1]
+
+        # ✅ 全局特征（可选）
         if self.use_global_encoder:
-            self.global_encoder(images)
+            self.global_latent = self.global_encoder(latent)
+        else:
+            self.global_latent = None
+
+        return latent
 
     def forward(self, xyz, coarse=True, viewdirs=None, far=False):
         """
-        Predict (r, g, b, sigma) at world space points xyz.
-        Please call encode first!
-        :param xyz (SB, B, 3)
-        :return (SB, B, 4) r g b sigma
+        前向传播
+        :param xyz (SB, B, 3) 3D 坐标（世界坐标系）
+        :param coarse bool 是否使用粗网络
+        :param viewdirs (SB, B, 3) 视角方向
+        :param far bool 是否是远距离点
+        :return (SB, B, 4) RGB + density
         """
-        with profiler.record_function("model_inference"):
+        with profiler.record_function("model_forward"):
             SB, B, _ = xyz.shape
-            NS = self.num_views_per_obj
 
-            # Transform query points
-            xyz = repeat_interleave(xyz, NS)
-            xyz_rot = torch.matmul(self.poses[:, None, :3, :3], xyz.unsqueeze(-1))[..., 0]
-            xyz = xyz_rot + self.poses[:, None, :3, 3]
+            # ✅ 从编码器获取像素对齐的特征
+            with profiler.record_function("encoder_index"):
+                # 将世界坐标转换到相机坐标
+                xyz_rot = torch.matmul(self.poses[:, None, :3, :3], xyz.unsqueeze(-1))[..., 0]
+                xyz_cam = xyz_rot + self.poses[:, None, :3, 3]
 
-            if self.d_in > 0:
-                # Encode xyz coordinates
-                if self.use_xyz:
-                    z_feature = xyz_rot.reshape(-1, 3) if self.normalize_z else xyz.reshape(-1, 3)
+                # 投影到图像平面
+                if self.focal.shape[-1] == 2:
+                    fx, fy = self.focal[..., 0], self.focal[..., 1]
                 else:
-                    z_feature = -xyz_rot[..., 2].reshape(-1, 1) if self.normalize_z else -xyz[..., 2].reshape(-1, 1)
+                    fx = fy = self.focal
 
-                if self.use_code and not self.use_code_viewdirs:
-                    z_feature = self.code(z_feature)
+                uv = torch.stack([
+                    xyz_cam[..., 0] / xyz_cam[..., 2] * fx[:, None],
+                    xyz_cam[..., 1] / xyz_cam[..., 2] * fy[:, None]
+                ], dim=-1)
 
-                if self.use_viewdirs:
-                    assert viewdirs is not None
-                    viewdirs = viewdirs.reshape(SB, B, 3, 1)
-                    viewdirs = repeat_interleave(viewdirs, NS)
-                    viewdirs = torch.matmul(self.poses[:, None, :3, :3], viewdirs)
-                    viewdirs = viewdirs.reshape(-1, 3)
-                    z_feature = torch.cat((z_feature, viewdirs), dim=1)
-
-                if self.use_code and self.use_code_viewdirs:
-                    z_feature = self.code(z_feature)
-
-                mlp_input = z_feature
-
-            if self.use_encoder:
-                # Get image features
-                uv = -xyz[:, :, :2] / xyz[:, :, 2:]
-                uv *= repeat_interleave(
-                    self.focal.unsqueeze(1), NS if self.focal.shape[0] > 1 else 1
-                )
-                uv += repeat_interleave(
-                    self.c.unsqueeze(1), NS if self.c.shape[0] > 1 else 1
-                )
-
-                latent = self.encoder.index(uv, None, self.image_shape)
-
-                if self.stop_encoder_grad:
-                    latent = latent.detach()
-
-                # ✅ 修复：确保 reshape 使用正确的维度
-                latent = latent.transpose(1, 2).reshape(-1, self.latent_size)
-
-                # ✅ 新增：使用注意力机制融合多视图特征
-                if self.use_attention and NS > 1:
-                    # Reshape to [SB, NS, B, latent_size]
-                    latent_views = latent.reshape(SB, NS, B, self.latent_size)
-
-                    # 对每个查询点，在多个视图间做注意力
-                    attended_features = []
-                    for i in range(SB):
-                        # [NS, B, latent_size] -> [B, NS, latent_size]
-                        view_features = latent_views[i].permute(1, 0, 2)
-
-                        # 应用注意力 [B, NS, latent_size]
-                        attended = self.attention(view_features)
-
-                        # 平均池化多视图 [B, latent_size]
-                        attended = attended.mean(dim=1)
-                        attended_features.append(attended)
-
-                    # 合并 batch [SB, B, latent_size]
-                    latent = torch.stack(attended_features, dim=0)
-                    latent = latent.reshape(-1, self.latent_size)
+                # 归一化到 [-1, 1]
+                if isinstance(self.latent, torch.Tensor):
+                    H, W = self.latent.shape[-2:]
                 else:
-                    # 不使用注意力时，保持原有逻辑
-                    pass
+                    H, W = self.latent[0].shape[-2:]
 
-                if self.d_in == 0:
-                    mlp_input = latent
+                uv = uv / torch.tensor([W / 2, H / 2], device=uv.device) - 1.0
+
+                # 采样特征
+                if isinstance(self.latent, torch.Tensor):
+                    # 单尺度特征
+                    latent_feat = torch.nn.functional.grid_sample(
+                        self.latent,
+                        uv.view(SB, 1, B, 2),
+                        align_corners=True,
+                        mode='bilinear',
+                        padding_mode='border'
+                    )  # (SB, C, 1, B)
+                    latent_feat = latent_feat.squeeze(2).transpose(1, 2)  # (SB, B, C)
                 else:
-                    mlp_input = torch.cat((latent, z_feature), dim=-1)
+                    # 多尺度特征（已融合）
+                    latent_feat = torch.nn.functional.grid_sample(
+                        self.latent,
+                        uv.view(SB, 1, B, 2),
+                        align_corners=True,
+                        mode='bilinear',
+                        padding_mode='border'
+                    )
+                    latent_feat = latent_feat.squeeze(2).transpose(1, 2)
 
-            if self.use_global_encoder:
-                global_latent = self.global_encoder.latent
-                assert mlp_input.shape[0] % global_latent.shape[0] == 0
-                num_repeats = mlp_input.shape[0] // global_latent.shape[0]
-                global_latent = repeat_interleave(global_latent, num_repeats)
-                mlp_input = torch.cat((global_latent, mlp_input), dim=-1)
+            # ✅ 构建 MLP 输入
+            mlp_input = latent_feat
 
-            # Run NeRF network
-            combine_index = None
-            dim_size = None
+            # 添加 xyz 编码
+            if self.use_xyz:
+                if self.use_code:
+                    xyz_encoded = self.code(xyz)
+                else:
+                    xyz_encoded = xyz
+                mlp_input = torch.cat([mlp_input, xyz_encoded], dim=-1)
 
-            if coarse or self.mlp_fine is None:
-                mlp_output = self.mlp_coarse(
-                    mlp_input,
-                    combine_inner_dims=(self.num_views_per_obj, B),
-                    combine_index=combine_index,
-                    dim_size=dim_size,
-                )
+            # 添加视角方向编码
+            if self.use_viewdirs and viewdirs is not None:
+                if self.use_code_viewdirs:
+                    viewdirs_encoded = self.code_viewdirs(viewdirs)
+                else:
+                    viewdirs_encoded = viewdirs
+                # viewdirs 作为 latent 输入
+                latent_input = viewdirs_encoded
             else:
-                mlp_output = self.mlp_fine(
-                    mlp_input,
-                    combine_inner_dims=(self.num_views_per_obj, B),
-                    combine_index=combine_index,
-                    dim_size=dim_size,
-                )
+                latent_input = None
 
-            mlp_output = mlp_output.reshape(-1, B, self.d_out)
+            # ✅ MLP 解码
+            mlp = self.mlp_coarse if coarse else self.mlp_fine
 
-            rgb = mlp_output[..., :3]
-            sigma = mlp_output[..., 3:4]
+            with profiler.record_function("mlp_forward"):
+                if latent_input is not None:
+                    mlp_output = mlp(mlp_input, combine_inner_dims=(1,), combine_index=mlp.d_latent, dim_size=B, latent=latent_input)
+                else:
+                    mlp_output = mlp(mlp_input, combine_inner_dims=(1,), combine_index=mlp.d_latent, dim_size=B)
 
-            # ✅ 确保输出在 [0, 1] 范围
-            output_list = [torch.sigmoid(rgb), torch.relu(sigma)]
-            output = torch.cat(output_list, dim=-1)
-            output = output.reshape(SB, B, -1)
-
-        return output
+            # ✅ 输出：RGB + density
+            return mlp_output
 
     def load_weights(self, args, opt_init=False, strict=True, device=None):
         """
-        Helper for loading weights according to argparse arguments.
-        Your can put a checkpoint at checkpoints/<exp>/pixel_nerf_init to use as initialization.
-        :param opt_init if true, loads from init checkpoint instead of usual even when resuming
+        加载预训练权重
         """
-        # TODO: make backups
-        if opt_init and not args.resume:
-            return
-        ckpt_name = (
-            "pixel_nerf_init" if opt_init or not args.resume else "pixel_nerf_latest"
-        )
-        model_path = "%s/%s/%s" % (args.checkpoints_path, args.name, ckpt_name)
-
         if device is None:
-            device = self.poses.device
+            device = torch.device("cpu")
 
-        if os.path.exists(model_path):
-            print("Load", model_path)
-            self.load_state_dict(
-                torch.load(model_path, map_location=device), strict=strict
-            )
-        elif not opt_init:
-            warnings.warn(
-                (
-                        "WARNING: {} does not exist, not loaded!! Model will be re-initialized.\n"
-                        + "If you are trying to load a pretrained model, STOP since it's not in the right place. "
-                        + "If training, unless you are startin a new experiment, please remember to pass --resume."
-                ).format(model_path)
-            )
-        return self
+        # 加载权重文件
+        if hasattr(args, 'resume') and args.resume and os.path.isfile(args.resume):
+            print(f"✅ Loading checkpoint from {args.resume}")
+            checkpoint = torch.load(args.resume, map_location=device)
 
-    def save_weights(self, args, opt_init=False):
+            # 加载模型权重
+            if "model_state_dict" in checkpoint:
+                self.load_state_dict(checkpoint["model_state_dict"], strict=strict)
+            elif "model" in checkpoint:
+                self.load_state_dict(checkpoint["model"], strict=strict)
+            else:
+                self.load_state_dict(checkpoint, strict=strict)
+
+            print("✅ Checkpoint loaded successfully")
+
+            return checkpoint
+        else:
+            if hasattr(args, 'resume') and args.resume:
+                warnings.warn(f"❌ Checkpoint file not found: {args.resume}")
+            return None
+
+    def save_weights(self, path, optimizer=None, epoch=None):
         """
-        Helper for saving weights according to argparse arguments
-        :param opt_init if true, saves from init checkpoint instead of usual
+        保存模型权重
         """
-        from shutil import copyfile
+        checkpoint = {
+            "model_state_dict": self.state_dict(),
+            "epoch": epoch,
+        }
+        if optimizer is not None:
+            checkpoint["optimizer_state_dict"] = optimizer.state_dict()
 
-        ckpt_name = "pixel_nerf_init" if opt_init else "pixel_nerf_latest"
-        backup_name = "pixel_nerf_init_backup" if opt_init else "pixel_nerf_backup"
+        torch.save(checkpoint, path)
+        print(f"✅ Checkpoint saved to {path}")
 
-        ckpt_path = osp.join(args.checkpoints_path, args.name, ckpt_name)
-        ckpt_backup_path = osp.join(args.checkpoints_path, args.name, backup_name)
 
-        if osp.exists(ckpt_path):
-            copyfile(ckpt_path, ckpt_backup_path)
-        torch.save(self.state_dict(), ckpt_path)
-        return self
+def make_model(conf):
+    """
+    创建 PixelNeRF 模型
+    """
+    return PixelNeRFNet(conf)

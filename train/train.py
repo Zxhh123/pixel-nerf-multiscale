@@ -1,6 +1,7 @@
-# Training to a set of multiple objects (e.g. ShapeNet or DTU)
-# tensorboard logs available in logs/<expname>
-
+"""
+Training to a set of multiple objects (e.g. ShapeNet or DTU)
+Enhanced with mixed precision training and gradient checking
+"""
 import sys
 import os
 
@@ -20,7 +21,7 @@ import torch
 from dotmap import DotMap
 
 # ✅ 添加混合精度训练支持
-from torch.amp import autocast, GradScaler
+from torch.cuda.amp import autocast, GradScaler
 
 
 def extra_args(parser):
@@ -52,19 +53,21 @@ def extra_args(parser):
         default=None,
         help="Use fixed test views",
     )
+
     # ✅ 混合精度训练参数
     parser.add_argument(
         "--use_amp",
         action="store_true",
-        default=True,
+        default=False,
         help="Use automatic mixed precision training",
     )
     parser.add_argument(
         "--no_amp",
         action="store_true",
         default=False,
-        help="Disable automatic mixed precision training",
+        help="Disable automatic mixed precision training (override config)",
     )
+
     # ✅ 梯度检查参数
     parser.add_argument(
         "--check_gradients",
@@ -78,15 +81,24 @@ def extra_args(parser):
         default=1.0,
         help="Gradient clipping threshold",
     )
+
     return parser
 
 
 args, conf = util.args.parse_args(extra_args, training=True, default_ray_batch_size=128)
 device = util.get_cuda(args.gpu_id[0])
 
-# ✅ 处理 AMP 标志
+# ✅ 处理 AMP 标志（优先级：命令行 > 配置文件）
 if args.no_amp:
     args.use_amp = False
+elif not args.use_amp and conf.get_bool("train.use_amp", False):
+    args.use_amp = True
+
+# ✅ 处理梯度裁剪配置
+if not args.check_gradients and conf.get_bool("train.check_gradients", False):
+    args.check_gradients = True
+if args.grad_clip == 1.0:  # 默认值
+    args.grad_clip = conf.get_float("train.grad_clip", 1.0)
 
 print("\n" + "=" * 80)
 print("🚀 PIXELNERF TRAINING - ENHANCED VERSION")
@@ -126,30 +138,26 @@ print(f"   - Encoder type: {net.encoder.__class__.__name__}")
 print(f"   - Latent size: {net.latent_size}")
 print(f"   - Use encoder: {net.use_encoder}")
 print(f"   - Use xyz: {net.use_xyz}")
+print(f"   - Use viewdirs: {net.use_viewdirs}")
 
 # ✅ 打印新增功能状态
 if hasattr(net, 'use_smart_fusion'):
     print(f"   - Smart fusion: {'✅ Enabled' if net.use_smart_fusion else '❌ Disabled'}")
     if net.use_smart_fusion:
-        print(f"      - Fusion type: {net.fusion_type if hasattr(net, 'fusion_type') else 'attention'}")
-        print(f"      - Fusion heads: {net.fusion_heads}")
-        print(f"      - CBAM: {'✅' if net.use_cbam else '❌'}")
+        print(f"     • Fusion type: {net.fusion_type}")
+        print(f"     • Fusion heads: {net.fusion_heads}")
+        print(f"     • CBAM: {'✅' if net.use_cbam else '❌'}")
 
 if hasattr(net, 'use_adaptive_sampling'):
     print(f"   - Adaptive sampling: {'✅ Enabled' if net.use_adaptive_sampling else '❌ Disabled'}")
     if net.use_adaptive_sampling:
-        print(f"      - Quality threshold: {net.quality_threshold}")
-
-if hasattr(net, 'use_attention'):
-    print(f"   - Legacy attention: {'✅ Enabled' if net.use_attention else '❌ Disabled'}")
-    if net.use_attention:
-        print(f"      - Attention heads: {net.attention_heads}")
+        print(f"     • Quality threshold: {net.quality_threshold}")
 
 # ✅ 打印编码器信息
 if hasattr(net.encoder, 'use_multi_scale'):
     print(f"   - Multi-scale encoder: {'✅ Enabled' if net.encoder.use_multi_scale else '❌ Disabled'}")
     if net.encoder.use_multi_scale:
-        print(f"      - Feature scales: {net.encoder.latent_size}")
+        print(f"     • Feature scales: {net.encoder.latent_size}")
 
 # ========== 创建渲染器 ==========
 print("\n🎨 Creating renderer...")
@@ -163,101 +171,75 @@ print(f"\n⚡ Setting up parallelization on GPUs: {args.gpu_id}")
 render_par = renderer.bind_parallel(net, args.gpu_id).eval()
 
 nviews = list(map(int, args.nviews.split()))
-print(f"✅ Multi-view setup: {nviews} views per batch")
+print(f"✅ Multi-view setup: {nviews} views")
 
 
+# ========== 创建训练器 ==========
 class PixelNeRFTrainer(trainlib.Trainer):
     def __init__(self):
-        # ✅ 传递 use_amp 参数到父类
-        super().__init__(
-            net,
-            dset,
-            val_dset,
-            args,
-            conf["train"],
-            device=device,
-            use_amp=args.use_amp
-        )
-
+        super().__init__(net, dset, val_dset, args, conf["train"], device=device)
         self.renderer_state_path = "%s/%s/_renderer" % (
             self.args.checkpoints_path,
             self.args.name,
         )
 
-        # ========== 损失函数配置 ==========
-        self.lambda_coarse = conf.get_float("loss.lambda_coarse")
-        self.lambda_fine = conf.get_float("loss.lambda_fine", 1.0)
-        print(f"\n📊 Loss configuration:")
-        print(f"   - Lambda coarse: {self.lambda_coarse}")
-        print(f"   - Lambda fine: {self.lambda_fine}")
-
-        self.rgb_coarse_crit = loss.get_rgb_loss(conf["loss.rgb"], True)
-        fine_loss_conf = conf["loss.rgb"]
-        if "rgb_fine" in conf["loss"]:
-            print("   - Using separate fine loss configuration")
-            fine_loss_conf = conf["loss.rgb_fine"]
-        self.rgb_fine_crit = loss.get_rgb_loss(fine_loss_conf, False)
-
-        # ========== 恢复渲染器状态 ==========
-        if args.resume:
-            if os.path.exists(self.renderer_state_path):
-                print(f"📥 Loading renderer state from {self.renderer_state_path}")
-                renderer.load_state_dict(
-                    torch.load(self.renderer_state_path, map_location=device)
-                )
-
-        # ========== 深度范围 ==========
-        self.z_near = dset.z_near
-        self.z_far = dset.z_far
-
-        # ========== BBox 采样 ==========
-        self.use_bbox = args.no_bbox_step > 0
-        if self.use_bbox:
-            print(f"📦 BBox sampling enabled (will disable at step {args.no_bbox_step})")
-
-        # ========== 混合精度训练 ==========
+        # ✅ 初始化混合精度训练
+        self.use_amp = args.use_amp
         if self.use_amp:
-            print("✅ Mixed Precision Training (AMP) enabled")
-            if not hasattr(self, 'scaler'):
-                self.scaler = GradScaler('cuda')
-                print("   - GradScaler initialized")
+            self.scaler = GradScaler()
+            print("✅ GradScaler initialized for mixed precision training")
         else:
-            print("❌ Mixed Precision Training (AMP) disabled")
+            self.scaler = None
 
-        # ========== 训练监控 ==========
-        self.global_step = 0
+        # ✅ 梯度裁剪配置
         self.check_gradients = args.check_gradients
         self.grad_clip = args.grad_clip
 
-        if self.check_gradients:
-            print(f"✅ Gradient checking enabled (clip threshold: {self.grad_clip})")
+        self.lambda_coarse = conf.get_float("loss.lambda_coarse")
+        self.lambda_fine = conf.get_float("loss.lambda_fine", 1.0)
+        print(
+            "lambda coarse {} and fine {}".format(self.lambda_coarse, self.lambda_fine)
+        )
+        self.rgb_coarse_crit = loss.get_rgb_loss(conf["loss.rgb"], True)
+        fine_loss_conf = conf["loss.rgb"]
+        if "rgb_fine" in conf["loss"]:
+            fine_loss_conf = conf["loss.rgb_fine"]
+        self.rgb_fine_crit = loss.get_rgb_loss(fine_loss_conf, False)
 
-        # ========== 统计信息 ==========
-        self.loss_history = []
-        self.psnr_history = []
-        self.best_psnr = 0.0
+        if args.resume:
+            # ✅ 加载检查点
+            checkpoint = net.load_weights(args, device=device)
+            if checkpoint is not None:
+                if "optimizer_state_dict" in checkpoint and self.optim is not None:
+                    self.optim.load_state_dict(checkpoint["optimizer_state_dict"])
+                    print("✅ Optimizer state loaded")
+                if "epoch" in checkpoint:
+                    self.start_epoch = checkpoint["epoch"] + 1
+                    print(f"✅ Resuming from epoch {self.start_epoch}")
 
-        print("\n" + "=" * 80)
-        print("✅ Trainer initialization complete!")
-        print("=" * 80 + "\n")
+        self.z_near = dset.z_near
+        self.z_far = dset.z_far
+
+        self.use_bbox = args.no_bbox_step > 0
 
     def post_batch(self, epoch, batch):
-        """Batch 结束后的回调"""
+        """
+        每个 batch 后的处理
+        """
         renderer.sched_step(args.batch_size)
 
     def extra_save_state(self):
-        """保存额外的状态"""
+        """
+        保存额外的状态
+        """
         torch.save(renderer.state_dict(), self.renderer_state_path)
 
     def calc_losses(self, data, is_train=True, global_step=0):
         """
-        计算损失函数
-
-        ✅ 适配新的 encoder 和 feature fusion
+        计算损失
         """
         if "images" not in data:
             return {}
-
         all_images = data["images"].to(device=device)  # (SB, NV, 3, H, W)
 
         SB, NV, _, H, W = all_images.shape
@@ -266,15 +248,13 @@ class PixelNeRFTrainer(trainlib.Trainer):
         all_focals = data["focal"]  # (SB)
         all_c = data.get("c")  # (SB)
 
-        # ========== BBox 采样控制 ==========
         if self.use_bbox and global_step >= args.no_bbox_step:
             self.use_bbox = False
-            print(f"\n📦 Stopped using bbox sampling @ step {global_step}\n")
+            print(">>> Stopped using bbox sampling @ iter", global_step)
 
         if not is_train or not self.use_bbox:
             all_bboxes = None
 
-        # ========== 准备数据 ==========
         all_rgb_gt = []
         all_rays = []
 
@@ -283,7 +263,6 @@ class PixelNeRFTrainer(trainlib.Trainer):
             image_ord = torch.randint(0, NV, (SB, 1))
         else:
             image_ord = torch.empty((SB, curr_nviews), dtype=torch.long)
-
         for obj_idx in range(SB):
             if all_bboxes is not None:
                 bboxes = all_bboxes[obj_idx]
@@ -291,18 +270,23 @@ class PixelNeRFTrainer(trainlib.Trainer):
             poses = all_poses[obj_idx]  # (NV, 4, 4)
             focal = all_focals[obj_idx]
             c = None
-            if "c" in data:
-                c = data["c"][obj_idx]
-
+            if all_c is not None:
+                c = all_c[obj_idx]
             if curr_nviews > 1:
+                # Somewhat inefficient, don't know better way
                 image_ord[obj_idx] = torch.from_numpy(
                     np.random.choice(NV, curr_nviews, replace=False)
                 )
-
             images_0to1 = images * 0.5 + 0.5
 
             cam_rays = util.gen_rays(
-                poses, W, H, focal, self.z_near, self.z_far, c=c
+                poses,
+                W,
+                H,
+                focal,
+                self.z_near,
+                self.z_far,
+                c=c,
             )  # (NV, H, W, 8)
             rgb_gt_all = images_0to1
             rgb_gt_all = (
@@ -334,150 +318,125 @@ class PixelNeRFTrainer(trainlib.Trainer):
 
         all_bboxes = all_poses = all_images = None
 
-        # ========== 编码（✅ 会自动使用新的 feature fusion） ==========
-        net.encode(
-            src_images,
-            src_poses,
-            all_focals.to(device=device),
-            c=all_c.to(device=device) if all_c is not None else None,
-        )
+        # ✅ 使用混合精度训练
+        if self.use_amp and is_train:
+            with autocast(device_type='cuda'):
+                net.encode(
+                    src_images,
+                    src_poses,
+                    all_focals.to(device=device),
+                    c=all_c.to(device=device) if all_c is not None else None,
+                )
 
-        # ========== 渲染 ==========
-        render_dict = DotMap(render_par(all_rays, want_weights=True))
-        coarse = render_dict.coarse
-        fine = render_dict.fine
-        using_fine = len(fine) > 0
+                render_dict = DotMap(render_par(all_rays, want_weights=True))
+                coarse = render_dict.coarse
+                fine = render_dict.fine
+                using_fine = len(fine) > 0
 
-        # ========== 计算损失 ==========
-        loss_dict = {}
+                loss_dict = {}
 
-        rgb_loss = self.rgb_coarse_crit(coarse.rgb, all_rgb_gt)
-        loss_dict["rc"] = rgb_loss.item() * self.lambda_coarse
+                rgb_loss = self.rgb_coarse_crit(coarse.rgb, all_rgb_gt)
+                loss_dict["rc"] = rgb_loss.item() * self.lambda_coarse
+                if using_fine:
+                    fine_loss = self.rgb_fine_crit(fine.rgb, all_rgb_gt)
+                    rgb_loss = rgb_loss * self.lambda_coarse + fine_loss * self.lambda_fine
+                    loss_dict["rf"] = fine_loss.item() * self.lambda_fine
 
-        if using_fine:
-            fine_loss = self.rgb_fine_crit(fine.rgb, all_rgb_gt)
-            rgb_loss = rgb_loss * self.lambda_coarse + fine_loss * self.lambda_fine
-            loss_dict["rf"] = fine_loss.item() * self.lambda_fine
-
-        loss = rgb_loss
-
-        # ========== 计算 PSNR ==========
-        if using_fine:
-            rgb_pred = fine.rgb
+                loss = rgb_loss
+                loss_dict["t"] = loss.item()
         else:
-            rgb_pred = coarse.rgb
+            # 标准训练（无混合精度）
+            net.encode(
+                src_images,
+                src_poses,
+                all_focals.to(device=device),
+                c=all_c.to(device=device) if all_c is not None else None,
+            )
 
-        mse = F.mse_loss(rgb_pred, all_rgb_gt)
-        psnr = -10 * torch.log10(mse)
-        loss_dict["psnr"] = psnr.item()
+            render_dict = DotMap(render_par(all_rays, want_weights=True))
+            coarse = render_dict.coarse
+            fine = render_dict.fine
+            using_fine = len(fine) > 0
 
-        if is_train:
-            loss_dict["loss"] = loss
+            loss_dict = {}
 
-        loss_dict["t"] = loss.item()
+            rgb_loss = self.rgb_coarse_crit(coarse.rgb, all_rgb_gt)
+            loss_dict["rc"] = rgb_loss.item() * self.lambda_coarse
+            if using_fine:
+                fine_loss = self.rgb_fine_crit(fine.rgb, all_rgb_gt)
+                rgb_loss = rgb_loss * self.lambda_coarse + fine_loss * self.lambda_fine
+                loss_dict["rf"] = fine_loss.item() * self.lambda_fine
 
-        return loss_dict
+            loss = rgb_loss
+            loss_dict["t"] = loss.item()
+
+        return loss, loss_dict
 
     def train_step(self, data, global_step):
         """
-        训练步骤
-
-        ✅ 使用混合精度训练
+        单步训练
         """
-        self.optimizer.zero_grad()
+        self.optim.zero_grad()
 
-        # ========== 混合精度训练 ==========
+        # ✅ 计算损失（内部处理混合精度）
+        loss, loss_dict = self.calc_losses(data, is_train=True, global_step=global_step)
+
+        # ✅ 反向传播
         if self.use_amp:
-            with autocast('cuda'):
-                loss_dict = self.calc_losses(data, is_train=True, global_step=global_step)
-                loss = loss_dict["loss"]
-
-            # 反向传播（使用 scaler）
             self.scaler.scale(loss).backward()
 
-            # ✅ 梯度检查和裁剪
+            # ✅ 梯度裁剪
             if self.check_gradients:
-                self.scaler.unscale_(self.optimizer)
+                self.scaler.unscale_(self.optim)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    net.parameters(),
-                    self.grad_clip
+                    net.parameters(), self.grad_clip
                 )
                 if global_step % 100 == 0:
-                    print(f"   📊 Step {global_step}: grad_norm={grad_norm:.4f}")
+                    print(f"   Gradient norm: {grad_norm:.4f}")
 
-            self.scaler.step(self.optimizer)
+            self.scaler.step(self.optim)
             self.scaler.update()
-
         else:
-            # ========== 原始训练流程 ==========
-            loss_dict = self.calc_losses(data, is_train=True, global_step=global_step)
-            loss = loss_dict["loss"]
             loss.backward()
 
-            # ✅ 梯度检查和裁剪
+            # ✅ 梯度裁剪
             if self.check_gradients:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
-                    net.parameters(),
-                    self.grad_clip
+                    net.parameters(), self.grad_clip
                 )
                 if global_step % 100 == 0:
-                    print(f"   📊 Step {global_step}: grad_norm={grad_norm:.4f}")
+                    print(f"   Gradient norm: {grad_norm:.4f}")
 
-            self.optimizer.step()
-
-        # ========== 记录历史 ==========
-        self.loss_history.append(loss_dict["t"])
-        self.psnr_history.append(loss_dict.get("psnr", 0))
-
-        # ========== 更新全局步数 ==========
-        self.global_step = global_step
-
-        # ========== 定期打印 ==========
-        if global_step % 50 == 0:
-            print(f"   Step {global_step}: loss={loss_dict['t']:.4f}, psnr={loss_dict.get('psnr', 0):.2f} dB")
+            self.optim.step()
 
         return loss_dict
 
     def eval_step(self, data, global_step):
         """
         验证步骤
-
-        ✅ 验证时也使用混合精度加速
         """
         renderer.eval()
-
-        if self.use_amp:
-            with torch.no_grad():
-                with autocast('cuda'):
-                    losses = self.calc_losses(data, is_train=False, global_step=global_step)
-        else:
-            with torch.no_grad():
-                losses = self.calc_losses(data, is_train=False, global_step=global_step)
-
+        losses = self.calc_losses(data, is_train=False, global_step=global_step)
         renderer.train()
         return losses
 
     def vis_step(self, data, global_step, idx=None):
         """
         可视化步骤
-
-        ✅ 适配新的编码器
         """
         if "images" not in data:
             return {}
-
         if idx is None:
             batch_idx = np.random.randint(0, data["images"].shape[0])
         else:
+            print(idx)
             batch_idx = idx
-
         images = data["images"][batch_idx].to(device=device)  # (NV, 3, H, W)
         poses = data["poses"][batch_idx].to(device=device)  # (NV, 4, 4)
         focal = data["focal"][batch_idx: batch_idx + 1]  # (1)
         c = data.get("c")
         if c is not None:
             c = c[batch_idx: batch_idx + 1]  # (1)
-
         NV, _, H, W = images.shape
         cam_rays = util.gen_rays(
             poses, W, H, focal, self.z_near, self.z_far, c=c
@@ -491,7 +450,7 @@ class PixelNeRFTrainer(trainlib.Trainer):
             view_dest += view_dest >= views_src[vs]
         views_src = torch.from_numpy(views_src)
 
-        # ========== 设置为评估模式 ==========
+        # set renderer net to eval mode
         renderer.eval()
         source_views = (
             images_0to1[views_src]
@@ -502,12 +461,9 @@ class PixelNeRFTrainer(trainlib.Trainer):
         )
 
         gt = images_0to1[view_dest].permute(1, 2, 0).cpu().numpy().reshape(H, W, 3)
-
         with torch.no_grad():
             test_rays = cam_rays[view_dest]  # (H, W, 8)
             test_images = images[views_src]  # (NS, 3, H, W)
-
-            # ✅ 编码（会自动使用新的 feature fusion）
             net.encode(
                 test_images.unsqueeze(0),
                 poses[views_src].unsqueeze(0),
@@ -515,14 +471,7 @@ class PixelNeRFTrainer(trainlib.Trainer):
                 c=c.to(device=device) if c is not None else None,
             )
             test_rays = test_rays.reshape(1, H * W, -1)
-
-            # ✅ 使用混合精度加速推理
-            if self.use_amp:
-                with autocast('cuda'):
-                    render_dict = DotMap(render_par(test_rays, want_weights=True))
-            else:
-                render_dict = DotMap(render_par(test_rays, want_weights=True))
-
+            render_dict = DotMap(render_par(test_rays, want_weights=True))
             coarse = render_dict.coarse
             fine = render_dict.fine
 
@@ -537,9 +486,12 @@ class PixelNeRFTrainer(trainlib.Trainer):
                 depth_fine_np = fine.depth[0].cpu().numpy().reshape(H, W)
                 rgb_fine_np = fine.rgb[0].cpu().numpy().reshape(H, W, 3)
 
-        print(f"Coarse: rgb [{rgb_coarse_np.min():.3f}, {rgb_coarse_np.max():.3f}], "
-              f"alpha [{alpha_coarse_np.min():.3f}, {alpha_coarse_np.max():.3f}]")
-
+        print("c rgb min {} max {}".format(rgb_coarse_np.min(), rgb_coarse_np.max()))
+        print(
+            "c alpha min {}, max {}".format(
+                alpha_coarse_np.min(), alpha_coarse_np.max()
+            )
+        )
         alpha_coarse_cmap = util.cmap(alpha_coarse_np) / 255
         depth_coarse_cmap = util.cmap(depth_coarse_np) / 255
         vis_list = [
@@ -554,8 +506,12 @@ class PixelNeRFTrainer(trainlib.Trainer):
         vis = vis_coarse
 
         if using_fine:
-            print(f"Fine: rgb [{rgb_fine_np.min():.3f}, {rgb_fine_np.max():.3f}], "
-                  f"alpha [{alpha_fine_np.min():.3f}, {alpha_fine_np.max():.3f}]")
+            print("f rgb min {} max {}".format(rgb_fine_np.min(), rgb_fine_np.max()))
+            print(
+                "f alpha min {}, max {}".format(
+                    alpha_fine_np.min(), alpha_fine_np.max()
+                )
+            )
             depth_fine_cmap = util.cmap(depth_fine_np) / 255
             alpha_fine_cmap = util.cmap(alpha_fine_np) / 255
             vis_list = [
@@ -574,78 +530,17 @@ class PixelNeRFTrainer(trainlib.Trainer):
 
         psnr = util.psnr(rgb_psnr, gt)
         vals = {"psnr": psnr}
-        print(f"Visualization PSNR: {psnr:.2f} dB")
+        print("psnr", psnr)
 
-        # ✅ 更新最佳 PSNR
-        if psnr > self.best_psnr:
-            self.best_psnr = psnr
-            print(f"🎉 New best PSNR: {psnr:.2f} dB")
-
-        # ========== 恢复训练模式 ==========
+        # set the renderer network back to train mode
         renderer.train()
         return vis, vals
 
-    def post_epoch(self, epoch):
-        """
-        Epoch 结束后的回调
-        """
-        # ========== 打印统计信息 ==========
-        if len(self.loss_history) > 0:
-            avg_loss = np.mean(self.loss_history[-100:])
-            avg_psnr = np.mean(self.psnr_history[-100:])
-            print(f"\n📊 Epoch {epoch} Summary:")
-            print(f"   - Average loss (last 100 steps): {avg_loss:.4f}")
-            print(f"   - Average PSNR (last 100 steps): {avg_psnr:.2f} dB")
-            print(f"   - Best PSNR so far: {self.best_psnr:.2f} dB")
-            print(f"   - Total steps: {self.global_step}")
 
+# ========== 开始训练 ==========
+print("\n" + "=" * 80)
+print("🎓 Starting training...")
+print("=" * 80 + "\n")
 
-# ✅ 创建训练器
-print("\n🎯 Creating trainer...")
 trainer = PixelNeRFTrainer()
-print("✅ Trainer created successfully\n")
-
-if __name__ == '__main__':
-    # ✅ 开始训练
-    print("=" * 80)
-    print("🚀 STARTING TRAINING")
-    print("=" * 80 + "\n")
-
-    try:
-        trainer.start()
-
-        print("\n" + "=" * 80)
-        print("🎉 TRAINING COMPLETED SUCCESSFULLY!")
-        print("=" * 80)
-        print(f"📊 Final Statistics:")
-        print(f"   - Total steps: {trainer.global_step}")
-        print(f"   - Best PSNR: {trainer.best_psnr:.2f} dB")
-        print("=" * 80 + "\n")
-
-    except KeyboardInterrupt:
-        print("\n" + "=" * 80)
-        print("⚠️  TRAINING INTERRUPTED BY USER")
-        print("=" * 80)
-        print(f"📊 Statistics at interruption:")
-        print(f"   - Steps completed: {trainer.global_step}")
-        print(f"   - Best PSNR: {trainer.best_psnr:.2f} dB")
-        print("=" * 80 + "\n")
-
-    except Exception as e:
-        print("\n" + "=" * 80)
-        print("❌ TRAINING FAILED!")
-        print("=" * 80)
-        print(f"Error: {e}")
-        import traceback
-
-        traceback.print_exc()
-        print("=" * 80 + "\n")
-
-    finally:
-        # ✅ 保存最终状态
-        if hasattr(trainer, 'extra_save_state'):
-            try:
-                trainer.extra_save_state()
-                print("💾 Final state saved successfully\n")
-            except Exception as e:
-                print(f"⚠️  Warning: Failed to save final state: {e}\n")
+trainer.start()
